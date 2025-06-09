@@ -1,8 +1,13 @@
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <emmintrin.h>
 #include <iostream>
-#include <map>
+#include <limits>
+#include <queue>
 #include <random>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // For SIMD intrinsics (SSSE3)
@@ -125,8 +130,9 @@ compute_distance_tables(const vec &query, const centroids_t &centroids) {
 }
 
 // --- Original PQ Scan method ---
-float pq_distance_original(const vec_u8 &pqcode,
-                           const std::vector<std::vector<float>> &dist_tables) {
+inline float
+pq_distance_original(const vec_u8 &pqcode,
+                     const std::vector<std::vector<float>> &dist_tables) {
   float total_dist = 0.0f;
   for (int m = 0; m < M; ++m) {
     total_dist += dist_tables[m][pqcode[m]];
@@ -134,28 +140,30 @@ float pq_distance_original(const vec_u8 &pqcode,
   return total_dist;
 }
 
-void run_pq_scan_original(const db_pqcodes_t &db,
-                          const std::vector<std::vector<float>> &dist_tables) {
+std::priority_queue<std::pair<float, int>>
+run_pq_scan_original(const db_pqcodes_t &db,
+                     const std::vector<std::vector<float>> &dist_tables,
+                     int topK = 100) {
   std::cout << "\n--- PQ Scan (Running Original PQ Scan) ---" << std::endl;
+  std::priority_queue<std::pair<float, int>> top_results;
   Timer timer;
   timer.start();
 
-  float min_dist = std::numeric_limits<float>::max();
-  int min_idx = -1;
   for (int i = 0; i < db.size(); ++i) {
     const auto &pqcode = db[i];
     float dist = pq_distance_original(pqcode, dist_tables);
-    if (dist < min_dist) {
-      min_dist = dist;
-      min_idx = i;
+    if (top_results.size() < topK) {
+      top_results.emplace(dist, i);
+    } else if (dist < top_results.top().first) {
+      top_results.pop();
+      top_results.emplace(dist, i);
     }
   }
 
   double elapsed = timer.stop();
   std::cout << "Original PQ Scan finished in: " << elapsed << " ms"
             << std::endl;
-  std::cout << "(Min distance found): " << min_dist << " at index " << min_idx
-            << std::endl;
+  return top_results;
 }
 
 // --- PQ Fast Scan method ---
@@ -172,190 +180,180 @@ uint8_t quantize_dist(float dist, float q_min, float q_max,
   // quantized to 127)
   if (dist >= q_max)
     return 127;
-  // (For values in (q_min,
-  // q_max), map to [0, 126])
-  if (inv_range_0_126 <= 0.0f) { // If q_max <= q_min
-    return 0; // All values considered at q_min
-  }
   float scaled = (dist - q_min) * inv_range_0_126;
   return static_cast<uint8_t>(std::min(std::max(0.0f, scaled), 126.0f));
 }
 
 // PQ Fast Scan implementation
-void run_pq_scan_fast(const db_pqcodes_t &db,
-                      const std::vector<std::vector<float>> &dist_tables) {
-  std::cout << "\n--- Running PQ Fast Scan ---"
-            << std::endl;
+std::priority_queue<std::pair<float, int>>
+run_pq_scan_fast(const db_pqcodes_t &db,
+                 const std::vector<std::vector<float>> &dist_tables,
+                 int topK = 100) {
+  std::cout << "\n--- Running PQ Fast Scan ---" << std::endl;
+  std::priority_queue<std::pair<float, int>> top_results;
   Timer timer;
   timer.start();
-
-  // 1. Find temporary nearest neighbor to determine q_max
-  float temp_min_dist_for_qmax = std::numeric_limits<float>::max();
-  int initial_scan_count = static_cast<int>(NUM_DB_VECTORS * KEEP_PERCENT);
-  if (initial_scan_count == 0 && NUM_DB_VECTORS > 0)
-    initial_scan_count = 1; // Scan at least one
-
-  for (int i = 0; i < initial_scan_count && i < db.size(); ++i) {
-    float dist = pq_distance_original(db[i], dist_tables);
-    if (dist < temp_min_dist_for_qmax) {
-      temp_min_dist_for_qmax = dist;
-    }
-  }
-
-  // Determine fixed q_min and q_max for quantization for this query
-  float q_min_fixed = std::numeric_limits<float>::max();
-  for (int m = 0; m < M; ++m) {
-    for (int k = 0; k < K_STAR; ++k) {
-      if (dist_tables[m][k] < q_min_fixed) {
-        q_min_fixed = dist_tables[m][k];
-      }
-    }
-  }
-  // If initial scan found no vectors (e.g., db is empty or KEEP_PERCENT is too small),
-  // temp_min_dist_for_qmax might still be max float.
-  // In such case, q_max needs a reasonable fallback, or based on max of dist_tables.
-  // Here we assume temp_min_dist_for_qmax was updated at least once.
-  float q_max_fixed = temp_min_dist_for_qmax;
-  if (db.empty())
-    q_max_fixed =
-        q_min_fixed + 1.0f; // Avoid division by zero if db is empty
-
-  float inv_range_0_126_fixed = 0.0f;
-  if (q_max_fixed > q_min_fixed) {
-    inv_range_0_126_fixed = 126.0f / (q_max_fixed - q_min_fixed);
-  }
-
-  uint8_t current_min_dist_quantized = quantize_dist(
-      temp_min_dist_for_qmax, q_min_fixed, q_max_fixed, inv_range_0_126_fixed);
-  float current_min_dist_float = temp_min_dist_for_qmax;
-  int min_idx = -1;
-
-  // 2. Create minimum tables S_GROUPING_COMPONENTS to S_M-1
-  std::vector<vec_u8> S_min_tables(M - GROUPING_COMPONENTS, vec_u8(16));
-  for (int m_orig = GROUPING_COMPONENTS; m_orig < M; ++m_orig) {
-    int min_table_idx = m_orig - GROUPING_COMPONENTS;
-    for (int portion_idx = 0; portion_idx < (K_STAR / 16); ++portion_idx) {
-      float min_val_in_portion = std::numeric_limits<float>::max();
-      for (int i = 0; i < 16; ++i) { // Each portion has 16 elements
-        min_val_in_portion = std::min(
-            min_val_in_portion, dist_tables[m_orig][portion_idx * 16 + i]);
-      }
-      S_min_tables[min_table_idx][portion_idx] = quantize_dist(
-          min_val_in_portion, q_min_fixed, q_max_fixed, inv_range_0_126_fixed);
-    }
-  }
-
-  // 3. Group database vectors
-  // key: (GROUPING_COMPONENTS * 4) bits for group ID, value: list of pqcode pointers
-  std::map<uint32_t, std::vector<const vec_u8 *>>
-      grouped_db; // uint32_t should be enough for GROUPING_COMPONENTS=4
+  // 1. Group database vectors by GROUPING_COMPONENTS
+  std::unordered_map<std::uint16_t, std::vector<const vec_u8 *>> grouped_db;
   for (const auto &pqcode : db) {
-    uint32_t group_id = 0;
+    std::uint16_t group_id = 0;
     for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
-      uint8_t portion_id_for_grouping =
-          pqcode[m] >> 4; // MSB 4 bits for group ID
-      group_id = (group_id << 4) | portion_id_for_grouping;
+      group_id = (group_id << 4) | (pqcode[m] >> 4); // MSB 4 bits for group ID
     }
     grouped_db[group_id].push_back(&pqcode);
   }
-
-  // 4. Iterate through all groups for scanning
-  long pruned_count = 0;
-  long total_processed_for_pruning = 0;
-
-  for (const auto &pair : grouped_db) {
-    const auto &group_id_key = pair.first; // Though unused, kept for structure
-    const auto &group_vectors = pair.second;
-
-    // 4.1 Create S_0 to S_GROUPING_COMPONENTS-1 for the current group
-    std::vector<vec_u8> S_group_specific_tables(GROUPING_COMPONENTS,
-                                                vec_u8(16));
-    for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
-      // Extract portion_id for this component from group_id_key
-      // MSB of group_id_key corresponds to m=0, LSB to m=GROUPING_COMPONENTS-1
-      uint8_t portion_id =
-          (group_id_key >> (4 * (GROUPING_COMPONENTS - 1 - m))) & 0x0F;
-      int start_k_in_dist_table = portion_id * 16;
-      for (int i = 0; i < 16; ++i) { // Each portion has 16 elements
-        S_group_specific_tables[m][i] =
-            quantize_dist(dist_tables[m][start_k_in_dist_table + i],
-                          q_min_fixed, q_max_fixed, inv_range_0_126_fixed);
-      }
-    }
-
-    // 4.2 Load all 8 small tables into SIMD registers
-    __m128i s_reg[M];
-    for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
-      s_reg[m] = _mm_loadu_si128(
-          reinterpret_cast<const __m128i *>(S_group_specific_tables[m].data()));
-    }
-    for (int m = GROUPING_COMPONENTS; m < M; ++m) {
-      s_reg[m] = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-          S_min_tables[m - GROUPING_COMPONENTS].data()));
-    }
-
-    // 4.3 Perform SIMD scan within the group
-    for (size_t vec_idx = 0; vec_idx < group_vectors.size(); ++vec_idx) {
-      const vec_u8 &pqcode = *group_vectors[vec_idx];
-      total_processed_for_pruning++;
-
-      // Calculate lower bound using SIMD
-      __m128i accumulated_sum_reg = _mm_setzero_si128();
-      for (int m = 0; m < M; ++m) {
-        uint8_t index_in_s_table;
-        if (m < GROUPING_COMPONENTS) {
-          index_in_s_table = pqcode[m] & 0x0F; // LSB 4 bits for S0-S3
-        } else {
-          index_in_s_table = pqcode[m] >> 4; // MSB 4 bits for S4-S7
-        }
-
-        __m128i shuffle_mask =
-            _mm_set1_epi8(static_cast<char>(index_in_s_table));
-        __m128i looked_up_val_broadcasted =
-            _mm_shuffle_epi8(s_reg[m], shuffle_mask);
-        accumulated_sum_reg =
-            _mm_adds_epu8(accumulated_sum_reg, looked_up_val_broadcasted);
-      }
-
-      // Extract lower bound result (only take the first lane as all lanes are the same)
-      uint8_t lower_bound_quantized =
-          static_cast<uint8_t>(_mm_extract_epi8(accumulated_sum_reg, 0));
-
-      if (lower_bound_quantized >= current_min_dist_quantized) {
-        pruned_count++;
-        continue;
-      }
-
-      // If not pruned, calculate exact distance.
-      // Find original index in db to compare results.
-      // Here we assume pqcode_ptr can uniquely identify the vector,
-      // but for updating min_idx, a global index is needed.
-      // For simplicity, we don't track the global min_idx here, only update the distance.
-      float dist_float = pq_distance_original(pqcode, dist_tables);
-      if (dist_float < current_min_dist_float) {
-        current_min_dist_float = dist_float;
-        // Update quantized nearest distance for subsequent pruning
-        current_min_dist_quantized =
-            quantize_dist(current_min_dist_float, q_min_fixed, q_max_fixed,
-                          inv_range_0_126_fixed);
-      }
+  // get the q_min and q_max for quantization
+  float qmin = std::numeric_limits<float>::max();
+  for (int m = 0; m < M; ++m) {
+    for (int k = 0; k < K_STAR; ++k) {
+      qmin = std::min(qmin, dist_tables[m][k]);
     }
   }
 
-  double elapsed = timer.stop();
-  std::cout << "PQ Fast Scan finished in: " << elapsed
-            << " ms" << std::endl;
-  if (total_processed_for_pruning > 0) {
-    std::cout << "Pruned " << pruned_count << " / "
-              << total_processed_for_pruning << " vectors ("
-              << (100.0 * pruned_count / total_processed_for_pruning) << "%)"
-              << std::endl;
-  } else {
-    std::cout << "No vectors processed for pruning."
-              << std::endl;
+  float qmax = std::numeric_limits<float>::min();
+  int keep_scan_count = static_cast<int>(NUM_DB_VECTORS * KEEP_PERCENT);
+  keep_scan_count = std::max(topK, keep_scan_count);
+  for (int i = 0; i < keep_scan_count && i < db.size(); ++i) {
+    float dist = pq_distance_original(db[i], dist_tables);
+    if (top_results.size() < topK) {
+      top_results.emplace(dist, i);
+    } else if (dist < top_results.top().first) {
+      top_results.pop();
+      top_results.emplace(dist, i);
+    }
   }
-  std::cout << "Min distance found: " << current_min_dist_float
-            << std::endl;
+  qmax = top_results.top().first;
+
+  float inv_range_0_126 = 126.0 / (qmax - qmin);
+  // Create quantization tables
+  std::vector<std::vector<uint8_t>> quantization_distances(
+      M, std::vector<uint8_t>(K_STAR / 16));
+  for (int m = 0; m < M; ++m) {
+    for (int k = 0; k < K_STAR; ++k) {
+      quantization_distances[m][k] =
+          quantize_dist(dist_tables[m][k], qmin, qmax, inv_range_0_126);
+    }
+  }
+
+  std::vector<std::vector<uint8_t>> minimum_tables(
+      M - GROUPING_COMPONENTS, std::vector<uint8_t>(K_STAR / 16));
+  // Calculate minimum quantized distances for each sub-quantizer
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    for (int k = 0; k < K_STAR / 16; ++k) {
+      auto smallest =
+          std::min_element(quantization_distances[m].begin() + k * 16,
+                           quantization_distances[m].begin() + (k + 1) * 16);
+      minimum_tables[m - GROUPING_COMPONENTS][k] = *smallest;
+    }
+  }
+
+  // Start Scanning
+  __m128i small_tables[M];
+  for (const auto &[group_id, group_vectors] : grouped_db) {
+    for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+      small_tables[m] = _mm_loadu_si128(const __m128i_u *p)
+    }
+  }
+
+  // // 4. Iterate through all groups for scanning
+  // long pruned_count = 0;
+  // long total_processed_for_pruning = 0;
+
+  // for (const auto &pair : grouped_db) {
+  //   const auto &group_id_key = pair.first; // Though unused, kept for
+  //   structure const auto &group_vectors = pair.second;
+
+  //   // 4.1 Create S_0 to S_GROUPING_COMPONENTS-1 for the current group
+  //   std::vector<vec_u8> S_group_specific_tables(GROUPING_COMPONENTS,
+  //                                               vec_u8(16));
+  //   for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+  //     // Extract portion_id for this component from group_id_key
+  //     // MSB of group_id_key corresponds to m=0, LSB to
+  //     m=GROUPING_COMPONENTS-1 uint8_t portion_id =
+  //         (group_id_key >> (4 * (GROUPING_COMPONENTS - 1 - m))) & 0x0F;
+  //     int start_k_in_dist_table = portion_id * 16;
+  //     for (int i = 0; i < 16; ++i) { // Each portion has 16 elements
+  //       S_group_specific_tables[m][i] =
+  //           quantize_dist(dist_tables[m][start_k_in_dist_table + i],
+  //                         q_min_fixed, q_max_fixed, inv_range_0_126_fixed);
+  //     }
+  //   }
+
+  //   // 4.2 Load all 8 small tables into SIMD registers
+  //   __m128i s_reg[M];
+  //   for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+  //     s_reg[m] = _mm_loadu_si128(
+  //         reinterpret_cast<const __m128i
+  //         *>(S_group_specific_tables[m].data()));
+  //   }
+  //   for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+  //     s_reg[m] = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+  //         S_min_tables[m - GROUPING_COMPONENTS].data()));
+  //   }
+
+  //   // 4.3 Perform SIMD scan within the group
+  //   for (size_t vec_idx = 0; vec_idx < group_vectors.size(); ++vec_idx) {
+  //     const vec_u8 &pqcode = *group_vectors[vec_idx];
+  //     total_processed_for_pruning++;
+
+  //     // Calculate lower bound using SIMD
+  //     __m128i accumulated_sum_reg = _mm_setzero_si128();
+  //     for (int m = 0; m < M; ++m) {
+  //       uint8_t index_in_s_table;
+  //       if (m < GROUPING_COMPONENTS) {
+  //         index_in_s_table = pqcode[m] & 0x0F; // LSB 4 bits for S0-S3
+  //       } else {
+  //         index_in_s_table = pqcode[m] >> 4; // MSB 4 bits for S4-S7
+  //       }
+
+  //       __m128i shuffle_mask =
+  //           _mm_set1_epi8(static_cast<char>(index_in_s_table));
+  //       __m128i looked_up_val_broadcasted =
+  //           _mm_shuffle_epi8(s_reg[m], shuffle_mask);
+  //       accumulated_sum_reg =
+  //           _mm_adds_epu8(accumulated_sum_reg, looked_up_val_broadcasted);
+  //     }
+
+  //     // Extract lower bound result (only take the first lane as all lanes
+  //     are
+  //     // the same)
+  //     uint8_t lower_bound_quantized =
+  //         static_cast<uint8_t>(_mm_extract_epi8(accumulated_sum_reg, 0));
+
+  //     if (lower_bound_quantized >= current_min_dist_quantized) {
+  //       pruned_count++;
+  //       continue;
+  //     }
+
+  //     // If not pruned, calculate exact distance.
+  //     // Find original index in db to compare results.
+  //     // Here we assume pqcode_ptr can uniquely identify the vector,
+  //     // but for updating min_idx, a global index is needed.
+  //     // For simplicity, we don't track the global min_idx here, only update
+  //     the
+  //     // distance.
+  //     float dist_float = pq_distance_original(pqcode, dist_tables);
+  //     if (dist_float < current_min_dist_float) {
+  //       current_min_dist_float = dist_float;
+  //       // Update quantized nearest distance for subsequent pruning
+  //       current_min_dist_quantized =
+  //           quantize_dist(current_min_dist_float, q_min_fixed, q_max_fixed,
+  //                         inv_range_0_126_fixed);
+  //     }
+  //   }
+  // }
+
+  // double elapsed = timer.stop();
+  // std::cout << "PQ Fast Scan finished in: " << elapsed << " ms" << std::endl;
+  // if (total_processed_for_pruning > 0) {
+  //   std::cout << "Pruned " << pruned_count << " / "
+  //             << total_processed_for_pruning << " vectors ("
+  //             << (100.0 * pruned_count / total_processed_for_pruning) << "%)"
+  //             << std::endl;
+  // } else {
+  //   std::cout << "No vectors processed for pruning." << std::endl;
+  // }
+  // std::cout << "Min distance found: " << current_min_dist_float << std::endl;
 }
 
 int main() {
@@ -390,8 +388,9 @@ int main() {
       compute_distance_tables(query, centroids);
 
   // 5. Execute and compare both methods
-  run_pq_scan_original(db_pqcodes, dist_tables);
-  run_pq_scan_fast(db_pqcodes, dist_tables);
+  int topK = 100;
+  run_pq_scan_original(db_pqcodes, dist_tables, topK);
+  run_pq_scan_fast(db_pqcodes, dist_tables, topK);
 
   return 0;
 }
