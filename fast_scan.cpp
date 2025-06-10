@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <emmintrin.h>
 #include <iostream>
@@ -12,6 +13,7 @@
 
 // For SIMD intrinsics (SSSE3)
 #include <immintrin.h>
+#include <xmmintrin.h>
 
 // --- Define core parameters ---
 const int D = 128; // vector dimension
@@ -184,9 +186,677 @@ uint8_t quantize_dist(float dist, float q_min, float q_max,
   return static_cast<uint8_t>(std::min(std::max(0.0f, scaled), 126.0f));
 }
 
+// --- SIMD processing functions for PQ Fast Scan ---
+
+// Processes 1 vector
+inline __m128i process_one(size_t vec_idx_base,
+                           const std::vector<const vec_u8 *> &group_vectors,
+                           const __m128i small_tables[M],
+                           int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 2 vectors
+inline __m128i process_two(size_t vec_idx_base,
+                           const std::vector<const vec_u8 *> &group_vectors,
+                           const __m128i small_tables[M],
+                           int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 3 vectors
+inline __m128i process_three(size_t vec_idx_base,
+                             const std::vector<const vec_u8 *> &group_vectors,
+                             const __m128i small_tables[M],
+                             int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 4 vectors
+inline __m128i process_four(size_t vec_idx_base,
+                            const std::vector<const vec_u8 *> &group_vectors,
+                            const __m128i small_tables[M],
+                            int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 5 vectors
+inline __m128i process_five(size_t vec_idx_base,
+                            const std::vector<const vec_u8 *> &group_vectors,
+                            const __m128i small_tables[M],
+                            int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 6 vectors
+inline __m128i process_six(size_t vec_idx_base,
+                           const std::vector<const vec_u8 *> &group_vectors,
+                           const __m128i small_tables[M],
+                           int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 7 vectors
+inline __m128i process_seven(size_t vec_idx_base,
+                             const std::vector<const vec_u8 *> &group_vectors,
+                             const __m128i small_tables[M],
+                             int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 8 vectors
+inline __m128i process_eight(size_t vec_idx_base,
+                             const std::vector<const vec_u8 *> &group_vectors,
+                             const __m128i small_tables[M],
+                             int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) & 0x0F;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) >> 4;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 9 vectors
+inline __m128i process_nine(size_t vec_idx_base,
+                            const std::vector<const vec_u8 *> &group_vectors,
+                            const __m128i small_tables[M],
+                            int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) & 0x0F;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) & 0x0F;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) >> 4;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) >> 4;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 10 vectors
+inline __m128i process_ten(size_t vec_idx_base,
+                           const std::vector<const vec_u8 *> &group_vectors,
+                           const __m128i small_tables[M],
+                           int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) & 0x0F;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) & 0x0F;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) & 0x0F;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) >> 4;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) >> 4;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) >> 4;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 11 vectors
+inline __m128i process_eleven(size_t vec_idx_base,
+                              const std::vector<const vec_u8 *> &group_vectors,
+                              const __m128i small_tables[M],
+                              int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) & 0x0F;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) & 0x0F;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) & 0x0F;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) & 0x0F;
+    shuffle_indices_buffer[10] = group_vectors[vec_idx_base + 10]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) >> 4;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) >> 4;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) >> 4;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) >> 4;
+    shuffle_indices_buffer[10] = group_vectors[vec_idx_base + 10]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 12 vectors
+inline __m128i process_twelve(size_t vec_idx_base,
+                              const std::vector<const vec_u8 *> &group_vectors,
+                              const __m128i small_tables[M],
+                              int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) & 0x0F;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) & 0x0F;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) & 0x0F;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) & 0x0F;
+    shuffle_indices_buffer[10] = group_vectors[vec_idx_base + 10]->at(m) & 0x0F;
+    shuffle_indices_buffer[11] = group_vectors[vec_idx_base + 11]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) >> 4;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) >> 4;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) >> 4;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) >> 4;
+    shuffle_indices_buffer[10] = group_vectors[vec_idx_base + 10]->at(m) >> 4;
+    shuffle_indices_buffer[11] = group_vectors[vec_idx_base + 11]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 13 vectors
+inline __m128i
+process_thirteen(size_t vec_idx_base,
+                 const std::vector<const vec_u8 *> &group_vectors,
+                 const __m128i small_tables[M], int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) & 0x0F;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) & 0x0F;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) & 0x0F;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) & 0x0F;
+    shuffle_indices_buffer[10] = group_vectors[vec_idx_base + 10]->at(m) & 0x0F;
+    shuffle_indices_buffer[11] = group_vectors[vec_idx_base + 11]->at(m) & 0x0F;
+    shuffle_indices_buffer[12] = group_vectors[vec_idx_base + 12]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) >> 4;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) >> 4;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) >> 4;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) >> 4;
+    shuffle_indices_buffer[10] = group_vectors[vec_idx_base + 10]->at(m) >> 4;
+    shuffle_indices_buffer[11] = group_vectors[vec_idx_base + 11]->at(m) >> 4;
+    shuffle_indices_buffer[12] = group_vectors[vec_idx_base + 12]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 14 vectors
+inline __m128i
+process_fourteen(size_t vec_idx_base,
+                 const std::vector<const vec_u8 *> &group_vectors,
+                 const __m128i small_tables[M], int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) & 0x0F;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) & 0x0F;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) & 0x0F;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) & 0x0F;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) & 0x0F;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) & 0x0F;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) & 0x0F;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) & 0x0F;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) & 0x0F;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) & 0x0F;
+    shuffle_indices_buffer[10] = group_vectors[vec_idx_base + 10]->at(m) & 0x0F;
+    shuffle_indices_buffer[11] = group_vectors[vec_idx_base + 11]->at(m) & 0x0F;
+    shuffle_indices_buffer[12] = group_vectors[vec_idx_base + 12]->at(m) & 0x0F;
+    shuffle_indices_buffer[13] = group_vectors[vec_idx_base + 13]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    shuffle_indices_buffer[0] = group_vectors[vec_idx_base]->at(m) >> 4;
+    shuffle_indices_buffer[1] = group_vectors[vec_idx_base + 1]->at(m) >> 4;
+    shuffle_indices_buffer[2] = group_vectors[vec_idx_base + 2]->at(m) >> 4;
+    shuffle_indices_buffer[3] = group_vectors[vec_idx_base + 3]->at(m) >> 4;
+    shuffle_indices_buffer[4] = group_vectors[vec_idx_base + 4]->at(m) >> 4;
+    shuffle_indices_buffer[5] = group_vectors[vec_idx_base + 5]->at(m) >> 4;
+    shuffle_indices_buffer[6] = group_vectors[vec_idx_base + 6]->at(m) >> 4;
+    shuffle_indices_buffer[7] = group_vectors[vec_idx_base + 7]->at(m) >> 4;
+    shuffle_indices_buffer[8] = group_vectors[vec_idx_base + 8]->at(m) >> 4;
+    shuffle_indices_buffer[9] = group_vectors[vec_idx_base + 9]->at(m) >> 4;
+    shuffle_indices_buffer[10] = group_vectors[vec_idx_base + 10]->at(m) >> 4;
+    shuffle_indices_buffer[11] = group_vectors[vec_idx_base + 11]->at(m) >> 4;
+    shuffle_indices_buffer[12] = group_vectors[vec_idx_base + 12]->at(m) >> 4;
+    shuffle_indices_buffer[13] = group_vectors[vec_idx_base + 13]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 15 vectors
+inline __m128i process_fifteen(size_t vec_idx_base,
+                               const std::vector<const vec_u8 *> &group_vectors,
+                               const __m128i small_tables[M],
+                               int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    for (int i = 0; i < 15; ++i)
+      shuffle_indices_buffer[i] = group_vectors[vec_idx_base + i]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    for (int i = 0; i < 15; ++i)
+      shuffle_indices_buffer[i] = group_vectors[vec_idx_base + i]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
+// Processes 16 vectors
+inline __m128i process_sixteen(size_t vec_idx_base,
+                               const std::vector<const vec_u8 *> &group_vectors,
+                               const __m128i small_tables[M],
+                               int8_t lower_bound_signed) {
+  uint8_t shuffle_indices_buffer[16];
+  __m128i accumulated_sums = _mm_setzero_si128();
+
+  for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
+    for (int i = 0; i < 16; ++i)
+      shuffle_indices_buffer[i] = group_vectors[vec_idx_base + i]->at(m) & 0x0F;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    for (int i = 0; i < 16; ++i)
+      shuffle_indices_buffer[i] = group_vectors[vec_idx_base + i]->at(m) >> 4;
+    __m128i shuffle_mask = _mm_loadu_si128(
+        reinterpret_cast<const __m128i *>(shuffle_indices_buffer));
+    __m128i shuffled_values = _mm_shuffle_epi8(small_tables[m], shuffle_mask);
+    accumulated_sums = _mm_adds_epu8(accumulated_sums, shuffled_values);
+  }
+
+  __m128i lower_bound_vec = _mm_set1_epi8(lower_bound_signed);
+  __m128i mask1 = _mm_cmpgt_epi8(lower_bound_vec, accumulated_sums);
+  __m128i mask2 = _mm_cmpeq_epi8(lower_bound_vec, accumulated_sums);
+  return _mm_or_si128(mask1, mask2);
+}
+
 // PQ Fast Scan implementation
 std::priority_queue<std::pair<float, int>>
-run_pq_scan_fast(const db_pqcodes_t &db,
+run_pq_scan_fast(db_pqcodes_t &db,
                  const std::vector<std::vector<float>> &dist_tables,
                  int topK = 100) {
   std::cout << "\n--- Running PQ Fast Scan ---" << std::endl;
@@ -195,11 +865,13 @@ run_pq_scan_fast(const db_pqcodes_t &db,
   timer.start();
   // 1. Group database vectors by GROUPING_COMPONENTS
   std::unordered_map<std::uint16_t, std::vector<const vec_u8 *>> grouped_db;
-  for (const auto &pqcode : db) {
+  for (int id = 0; id < db.size(); ++id) {
+    auto &pqcode = db[id];
     std::uint16_t group_id = 0;
     for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
       group_id = (group_id << 4) | (pqcode[m] >> 4); // MSB 4 bits for group ID
     }
+    pqcode.push_back(id); // Store the original index in the vector
     grouped_db[group_id].push_back(&pqcode);
   }
   // get the q_min and q_max for quantization
@@ -227,7 +899,7 @@ run_pq_scan_fast(const db_pqcodes_t &db,
   float inv_range_0_126 = 126.0 / (qmax - qmin);
   // Create quantization tables
   std::vector<std::vector<uint8_t>> quantization_distances(
-      M, std::vector<uint8_t>(K_STAR / 16));
+      M, std::vector<uint8_t>(K_STAR));
   for (int m = 0; m < M; ++m) {
     for (int k = 0; k < K_STAR; ++k) {
       quantization_distances[m][k] =
@@ -249,111 +921,160 @@ run_pq_scan_fast(const db_pqcodes_t &db,
 
   // Start Scanning
   __m128i small_tables[M];
+  // Load the minimum tables into SIMD registers
+  for (int m = GROUPING_COMPONENTS; m < M; ++m) {
+    small_tables[m] = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
+        minimum_tables[m - GROUPING_COMPONENTS].data()));
+  }
+
   for (const auto &[group_id, group_vectors] : grouped_db) {
+    // Prepare small_tables for the current group (group-specific part)
     for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
-      small_tables[m] = _mm_loadu_si128(const __m128i_u *p)
+      uint8_t portion_id =
+          (group_id >> (4 * (GROUPING_COMPONENTS - 1 - m))) & 0x0F;
+      const uint8_t *small_table_ptr_const = // Use const uint8_t*
+          quantization_distances[m].data() + portion_id * 16;
+      small_tables[m] = _mm_loadu_si128(
+          reinterpret_cast<const __m128i *>(small_table_ptr_const));
+    }
+    // small_tables for m >= GROUPING_COMPONENTS are already loaded from
+    // minimum_tables and are group-independent.
+
+    uint8_t current_pruning_threshold =
+        quantize_dist(top_results.top().first, qmin, qmax, inv_range_0_126);
+    __m128i result_mask;
+    for (int vid = 0; vid + 16 <= group_vectors.size(); vid += 16) {
+      result_mask = process_sixteen(vid, group_vectors, small_tables,
+                                    (int8_t)current_pruning_threshold);
+      for (int i = 0; i < 16; ++i) {
+        if (((uint8_t *)&result_mask)[i] ==
+            0xFF) { // Check if this vector is a candidate
+          const vec_u8 &pqcode = *group_vectors[vid + i];
+          float dist = pq_distance_original(pqcode, dist_tables);
+          int original_db_idx =
+              pqcode.back(); // Assuming original index is stored
+          if (top_results.size() < topK) {
+            top_results.emplace(dist, original_db_idx);
+            current_pruning_threshold = quantize_dist(
+                top_results.top().first, qmin, qmax, inv_range_0_126);
+          } else if (dist < top_results.top().first) {
+            top_results.pop();
+            top_results.emplace(dist, original_db_idx);
+            current_pruning_threshold = quantize_dist(
+                top_results.top().first, qmin, qmax, inv_range_0_126);
+          }
+        }
+      }
+    }
+
+    // Process remaining vectors in the group
+    size_t remaining = group_vectors.size() % 16;
+    size_t current_idx_in_group = group_vectors.size() - remaining;
+    if (remaining > 0) {
+      switch (remaining) {
+      case 15:
+        result_mask =
+            process_fifteen(current_idx_in_group, group_vectors, small_tables,
+                            (int8_t)current_pruning_threshold);
+        break;
+      case 14:
+        result_mask =
+            process_fourteen(current_idx_in_group, group_vectors, small_tables,
+                             (int8_t)current_pruning_threshold);
+        break;
+      case 13:
+        result_mask =
+            process_thirteen(current_idx_in_group, group_vectors, small_tables,
+                             (int8_t)current_pruning_threshold);
+        break;
+      case 12:
+        result_mask =
+            process_twelve(current_idx_in_group, group_vectors, small_tables,
+                           (int8_t)current_pruning_threshold);
+        break;
+      case 11:
+        result_mask =
+            process_eleven(current_idx_in_group, group_vectors, small_tables,
+                           (int8_t)current_pruning_threshold);
+        break;
+      case 10:
+        result_mask =
+            process_ten(current_idx_in_group, group_vectors, small_tables,
+                        (int8_t)current_pruning_threshold);
+        break;
+      case 9:
+        result_mask =
+            process_nine(current_idx_in_group, group_vectors, small_tables,
+                         (int8_t)current_pruning_threshold);
+        break;
+      case 8:
+        result_mask =
+            process_eight(current_idx_in_group, group_vectors, small_tables,
+                          (int8_t)current_pruning_threshold);
+        break;
+      case 7:
+        result_mask =
+            process_seven(current_idx_in_group, group_vectors, small_tables,
+                          (int8_t)current_pruning_threshold);
+        break;
+      case 6:
+        result_mask =
+            process_six(current_idx_in_group, group_vectors, small_tables,
+                        (int8_t)current_pruning_threshold);
+        break;
+      case 5:
+        result_mask =
+            process_five(current_idx_in_group, group_vectors, small_tables,
+                         (int8_t)current_pruning_threshold);
+        break;
+      case 4:
+        result_mask =
+            process_four(current_idx_in_group, group_vectors, small_tables,
+                         (int8_t)current_pruning_threshold);
+        break;
+      case 3:
+        result_mask =
+            process_three(current_idx_in_group, group_vectors, small_tables,
+                          (int8_t)current_pruning_threshold);
+        break;
+      case 2:
+        result_mask =
+            process_two(current_idx_in_group, group_vectors, small_tables,
+                        (int8_t)current_pruning_threshold);
+        break;
+      case 1:
+        result_mask =
+            process_one(current_idx_in_group, group_vectors, small_tables,
+                        (int8_t)current_pruning_threshold);
+        break;
+      }
+    }
+    for (int i = 0; i < remaining; ++i) {
+      if (((uint8_t *)&result_mask)[i] ==
+          0xFF) { // Check if this vector is a candidate
+        const vec_u8 &pqcode = *group_vectors[current_idx_in_group + i];
+        float dist = pq_distance_original(pqcode, dist_tables);
+        int original_db_idx =
+            pqcode.back(); // Assuming original index is stored
+        if (top_results.size() < topK) {
+          top_results.emplace(dist, original_db_idx);
+          current_pruning_threshold = quantize_dist(
+              top_results.top().first, qmin, qmax, inv_range_0_126);
+        } else if (dist < top_results.top().first) {
+          top_results.pop();
+          top_results.emplace(dist, original_db_idx);
+          current_pruning_threshold = quantize_dist(
+              top_results.top().first, qmin, qmax, inv_range_0_126);
+        }
+      }
     }
   }
 
-  // // 4. Iterate through all groups for scanning
-  // long pruned_count = 0;
-  // long total_processed_for_pruning = 0;
-
-  // for (const auto &pair : grouped_db) {
-  //   const auto &group_id_key = pair.first; // Though unused, kept for
-  //   structure const auto &group_vectors = pair.second;
-
-  //   // 4.1 Create S_0 to S_GROUPING_COMPONENTS-1 for the current group
-  //   std::vector<vec_u8> S_group_specific_tables(GROUPING_COMPONENTS,
-  //                                               vec_u8(16));
-  //   for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
-  //     // Extract portion_id for this component from group_id_key
-  //     // MSB of group_id_key corresponds to m=0, LSB to
-  //     m=GROUPING_COMPONENTS-1 uint8_t portion_id =
-  //         (group_id_key >> (4 * (GROUPING_COMPONENTS - 1 - m))) & 0x0F;
-  //     int start_k_in_dist_table = portion_id * 16;
-  //     for (int i = 0; i < 16; ++i) { // Each portion has 16 elements
-  //       S_group_specific_tables[m][i] =
-  //           quantize_dist(dist_tables[m][start_k_in_dist_table + i],
-  //                         q_min_fixed, q_max_fixed, inv_range_0_126_fixed);
-  //     }
-  //   }
-
-  //   // 4.2 Load all 8 small tables into SIMD registers
-  //   __m128i s_reg[M];
-  //   for (int m = 0; m < GROUPING_COMPONENTS; ++m) {
-  //     s_reg[m] = _mm_loadu_si128(
-  //         reinterpret_cast<const __m128i
-  //         *>(S_group_specific_tables[m].data()));
-  //   }
-  //   for (int m = GROUPING_COMPONENTS; m < M; ++m) {
-  //     s_reg[m] = _mm_loadu_si128(reinterpret_cast<const __m128i *>(
-  //         S_min_tables[m - GROUPING_COMPONENTS].data()));
-  //   }
-
-  //   // 4.3 Perform SIMD scan within the group
-  //   for (size_t vec_idx = 0; vec_idx < group_vectors.size(); ++vec_idx) {
-  //     const vec_u8 &pqcode = *group_vectors[vec_idx];
-  //     total_processed_for_pruning++;
-
-  //     // Calculate lower bound using SIMD
-  //     __m128i accumulated_sum_reg = _mm_setzero_si128();
-  //     for (int m = 0; m < M; ++m) {
-  //       uint8_t index_in_s_table;
-  //       if (m < GROUPING_COMPONENTS) {
-  //         index_in_s_table = pqcode[m] & 0x0F; // LSB 4 bits for S0-S3
-  //       } else {
-  //         index_in_s_table = pqcode[m] >> 4; // MSB 4 bits for S4-S7
-  //       }
-
-  //       __m128i shuffle_mask =
-  //           _mm_set1_epi8(static_cast<char>(index_in_s_table));
-  //       __m128i looked_up_val_broadcasted =
-  //           _mm_shuffle_epi8(s_reg[m], shuffle_mask);
-  //       accumulated_sum_reg =
-  //           _mm_adds_epu8(accumulated_sum_reg, looked_up_val_broadcasted);
-  //     }
-
-  //     // Extract lower bound result (only take the first lane as all lanes
-  //     are
-  //     // the same)
-  //     uint8_t lower_bound_quantized =
-  //         static_cast<uint8_t>(_mm_extract_epi8(accumulated_sum_reg, 0));
-
-  //     if (lower_bound_quantized >= current_min_dist_quantized) {
-  //       pruned_count++;
-  //       continue;
-  //     }
-
-  //     // If not pruned, calculate exact distance.
-  //     // Find original index in db to compare results.
-  //     // Here we assume pqcode_ptr can uniquely identify the vector,
-  //     // but for updating min_idx, a global index is needed.
-  //     // For simplicity, we don't track the global min_idx here, only update
-  //     the
-  //     // distance.
-  //     float dist_float = pq_distance_original(pqcode, dist_tables);
-  //     if (dist_float < current_min_dist_float) {
-  //       current_min_dist_float = dist_float;
-  //       // Update quantized nearest distance for subsequent pruning
-  //       current_min_dist_quantized =
-  //           quantize_dist(current_min_dist_float, q_min_fixed, q_max_fixed,
-  //                         inv_range_0_126_fixed);
-  //     }
-  //   }
-  // }
-
-  // double elapsed = timer.stop();
-  // std::cout << "PQ Fast Scan finished in: " << elapsed << " ms" << std::endl;
-  // if (total_processed_for_pruning > 0) {
-  //   std::cout << "Pruned " << pruned_count << " / "
-  //             << total_processed_for_pruning << " vectors ("
-  //             << (100.0 * pruned_count / total_processed_for_pruning) << "%)"
-  //             << std::endl;
-  // } else {
-  //   std::cout << "No vectors processed for pruning." << std::endl;
-  // }
-  // std::cout << "Min distance found: " << current_min_dist_float << std::endl;
+  auto elapsed = timer.stop();
+  std::cout << "PQ Fast Scan completed in " << elapsed << " seconds."
+            << std::endl;
+  std::cout << "Top " << topK << " results:" << std::endl;
+  return top_results;
 }
 
 int main() {
