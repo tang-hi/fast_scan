@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <emmintrin.h>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <queue>
@@ -1077,27 +1078,128 @@ run_pq_scan_fast(db_pqcodes_t &db,
   return top_results;
 }
 
-int main() {
+void save_pqcodes_to_disk(const db_pqcodes_t &db_pqcodes,
+                          const centroids_t &centroids) {
+  // 1. Save centroids to disk
+  std::ofstream ofs("pqcodes.bin", std::ios::binary);
+  if (!ofs) {
+    std::cerr << "Error opening file for writing." << std::endl;
+    return;
+  }
+  uint32_t num_centroids = centroids.size();
+  ofs.write(reinterpret_cast<const char *>(&num_centroids),
+            sizeof(num_centroids));
+  for (const auto &centroid : centroids) {
+    uint32_t centroid_size = centroid.size();
+    ofs.write(reinterpret_cast<const char *>(&centroid_size),
+              sizeof(centroid_size));
+    for (const auto &value : centroid) {
+      uint32_t dim = value.size();
+      ofs.write(reinterpret_cast<const char *>(&dim), sizeof(dim));
+      for (const auto &val : value) {
+        ofs.write(reinterpret_cast<const char *>(&val), sizeof(val));
+      }
+    }
+  }
+
+  // 2. Save PQ codes to disk
+  uint32_t num_pqcodes = db_pqcodes.size();
+  ofs.write(reinterpret_cast<const char *>(&num_pqcodes), sizeof(num_pqcodes));
+  for (const auto &pqcode : db_pqcodes) {
+    uint32_t pqcode_size = pqcode.size();
+    ofs.write(reinterpret_cast<const char *>(&pqcode_size),
+              sizeof(pqcode_size));
+    for (const auto &value : pqcode) {
+      ofs.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    }
+  }
+  ofs.close();
+  std::cout << "PQ codes saved to pqcodes.bin" << std::endl;
+}
+
+void load_pqcodes_from_disk(db_pqcodes_t &db_pqcodes, centroids_t &centroids) {
+  // 1. Load centroids from disk
+  std::ifstream ifs("pqcodes.bin", std::ios::binary);
+  if (!ifs) {
+    std::cerr << "Error opening file for reading." << std::endl;
+    return;
+  }
+  uint32_t num_centroids;
+  ifs.read(reinterpret_cast<char *>(&num_centroids), sizeof(num_centroids));
+  centroids.resize(num_centroids);
+  for (auto &centroid : centroids) {
+    uint32_t centroid_size;
+    ifs.read(reinterpret_cast<char *>(&centroid_size), sizeof(centroid_size));
+    centroid.resize(centroid_size);
+    for (auto &value : centroid) {
+      uint32_t dim;
+      ifs.read(reinterpret_cast<char *>(&dim), sizeof(dim));
+      value.resize(dim);
+      for (auto &val : value) {
+        ifs.read(reinterpret_cast<char *>(&val), sizeof(val));
+      }
+    }
+  }
+
+  // 2. Load PQ codes from disk
+  uint32_t num_pqcodes;
+  ifs.read(reinterpret_cast<char *>(&num_pqcodes), sizeof(num_pqcodes));
+  db_pqcodes.resize(num_pqcodes);
+  for (auto &pqcode : db_pqcodes) {
+    uint32_t pqcode_size;
+    ifs.read(reinterpret_cast<char *>(&pqcode_size), sizeof(pqcode_size));
+    pqcode.resize(pqcode_size);
+    for (auto &value : pqcode) {
+      ifs.read(reinterpret_cast<char *>(&value), sizeof(value));
+    }
+  }
+  ifs.close();
+  std::cout << "PQ codes loaded from pqcodes.bin" << std::endl;
+}
+
+int main(int argc, char *argv[]) {
+  bool save_pqcodes = false;
+  bool load_pqcodes = false;
+  if (argc == 2) {
+    if (std::string(argv[1]) == "--save-pqcodes") {
+      save_pqcodes = true;
+    } else if (std::string(argv[1]) == "--load-pqcodes") {
+      load_pqcodes = true;
+    } else {
+      std::cerr << "Unknown argument: " << argv[1] << std::endl;
+      return 1;
+    }
+  }
   // 1. Generate optimized centroids based on section 4.3 of the paper
   centroids_t centroids = generate_centroids_optimized();
-
-  // 2. Generate and encode database vectors
-  std::cout << "Generating " << NUM_DB_VECTORS << " database vectors..."
-            << std::endl;
   db_pqcodes_t db_pqcodes;
-  db_pqcodes.reserve(NUM_DB_VECTORS);
   std::random_device rd;
   std::mt19937 gen(rd());
   std::uniform_real_distribution<> dis_vec_val(
       -10.0, 10.0); // Range for database vector values
 
-  for (int i = 0; i < NUM_DB_VECTORS; ++i) {
-    vec v(D);
-    for (int d_idx = 0; d_idx < D; ++d_idx)
-      v[d_idx] = dis_vec_val(gen);
-    db_pqcodes.push_back(encode_vector(v, centroids));
+  if (load_pqcodes) {
+    std::cout << "Loading PQ codes from disk..." << std::endl;
+    load_pqcodes_from_disk(db_pqcodes, centroids);
+  } else {
+    std::cout << "Generating PQ codes..." << std::endl;
+
+    // 2. Generate and encode database vectors
+    std::cout << "Generating " << NUM_DB_VECTORS << " database vectors..."
+              << std::endl;
+    db_pqcodes.reserve(NUM_DB_VECTORS);
+    for (int i = 0; i < NUM_DB_VECTORS; ++i) {
+      vec v(D);
+      for (int d_idx = 0; d_idx < D; ++d_idx)
+        v[d_idx] = dis_vec_val(gen);
+      db_pqcodes.push_back(encode_vector(v, centroids));
+    }
   }
 
+  if (save_pqcodes) {
+    std::cout << "Saving PQ codes to disk..." << std::endl;
+    save_pqcodes_to_disk(db_pqcodes, centroids);
+  }
   // 3. Generate a random query vector
   std::cout << "Generating random query vector..." << std::endl;
   vec query(D);
